@@ -34,6 +34,9 @@ public interface VerificationRepository {
     /** Registers a new verification code for the given user. */
     public String generateVerificationCode(BareJID jid) throws AlreadyRegisteredException, TigaseDBException;
 
+    /** Sets a custom verification code for the given user. */
+    public void setVerificationCode(BareJID jid, String code) throws AlreadyRegisteredException, TigaseDBException;
+
     /** Verifies and delete the given verification. */
     public boolean verifyCode(BareJID jid, String code) throws TigaseDBException;
 

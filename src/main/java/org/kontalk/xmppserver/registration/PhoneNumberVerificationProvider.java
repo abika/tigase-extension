@@ -18,8 +18,12 @@
 
 package org.kontalk.xmppserver.registration;
 
+import tigase.server.Packet;
+import tigase.xmpp.JID;
+
 import java.io.IOException;
 import java.util.Map;
+import java.util.Queue;
 
 
 /**
@@ -34,6 +38,18 @@ public interface PhoneNumberVerificationProvider {
 
     public String getAckInstructions();
 
+    /** Returns true if this provider is asynchronous. */
+    public boolean isAsync();
+
+    /**
+     * Sends a verification code request.
+     * @return the request ID to wait for
+     */
+    public String sendVerificationCodeAsync(String phoneNumber, JID serverJid, Queue<Packet> results) throws IOException;
+
+    public String processAsyncResult(String requestId, String phoneNumber, Packet packet);
+
+    /** Sends a verification code to the user. */
     public void sendVerificationCode(String phoneNumber, String code) throws IOException;
 
 }

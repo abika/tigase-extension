@@ -48,15 +48,7 @@ import tigase.server.Packet;
 import tigase.stats.StatisticsList;
 import tigase.util.Base64;
 import tigase.xml.Element;
-import tigase.xmpp.Authorization;
-import tigase.xmpp.BareJID;
-import tigase.xmpp.NotAuthorizedException;
-import tigase.xmpp.PacketErrorTypeException;
-import tigase.xmpp.StanzaType;
-import tigase.xmpp.XMPPException;
-import tigase.xmpp.XMPPProcessor;
-import tigase.xmpp.XMPPProcessorIfc;
-import tigase.xmpp.XMPPResourceConnection;
+import tigase.xmpp.*;
 
 import com.google.i18n.phonenumbers.NumberParseException;
 import com.google.i18n.phonenumbers.PhoneNumberUtil;
@@ -75,7 +67,8 @@ public class KontalkIqRegister extends XMPPProcessor implements XMPPProcessorIfc
     public static final String ID = "kontalk:jabber:iq:register";
 
     private static Logger log = Logger.getLogger(KontalkIqRegister.class.getName());
-    private static final String[] XMLNSS = {"jabber:iq:register"};
+    public static final String XMLNS = "jabber:iq:register";
+    private static final String[] XMLNSS = {XMLNS};
 
     // form XPath and xmlns
     private static final String IQ_FORM_ELEM_NAME = "x" ;
@@ -91,6 +84,10 @@ public class KontalkIqRegister extends XMPPProcessor implements XMPPProcessorIfc
             new String[]{"http://jabber.org/features/iq-register"})};
     private static final Element[] DISCO_FEATURES = {new Element("feature", new String[]{"var"},
             new String[]{"jabber:iq:register"})};
+
+    private static final String ASYNC_REQUEST_ID = ID + ":async_request_id";
+    private static final String ASYNC_SESSION = ID + ":session";
+    private static final String ASYNC_PHONE_NUMBER = ID + ":async_phone_number";
 
     private static final String ERROR_INVALID_CODE = "Invalid verification code.";
     private static final String ERROR_MALFORMED_REQUEST = "Please provide either a phone number or a public key and a verification code.";
@@ -211,9 +208,8 @@ public class KontalkIqRegister extends XMPPProcessor implements XMPPProcessorIfc
                             // phone number
                             String phone = form.getAsString(FORM_FIELD_PHONE);
                             if (phone != null) {
-                                Packet response = registerPhone(session, packet, phone);
+                                registerPhone(session, packet, phone, results);
                                 statsRegistrationAttempts++;
-                                results.offer(response);
                                 break;
                             }
 
@@ -253,6 +249,46 @@ public class KontalkIqRegister extends XMPPProcessor implements XMPPProcessorIfc
                         // TODO instructions form
                         break;
                     }
+
+                    case result: {
+                        // result from async request?
+                        if (provider.isAsync()) {
+                            // FIXME this is not the same session of the initial user request
+                            String requestId = (String) session.getSessionData(ASYNC_REQUEST_ID);
+                            String phoneNumber = (String) session.getSessionData(ASYNC_PHONE_NUMBER);
+                            if (requestId != null && phoneNumber != null) {
+                                String code = provider.processAsyncResult(requestId, phoneNumber, packet);
+                                if (code != null) {
+                                    // generate userid from phone number
+                                    String userId = generateUserId(phoneNumber);
+                                    BareJID jid = BareJID.bareJIDInstanceNS(userId, session.getDomainAsJID().getDomain());
+
+                                    try {
+                                        saveVerificationCode(jid, code);
+
+                                        Packet result = packet.okResult(prepareSMSResponseForm(provider.getSenderId()), 0);
+                                        JID sessionTo = (JID) session.getSessionData(ASYNC_SESSION);
+                                        result.setPacketTo(sessionTo);
+                                        results.offer(result);
+                                    }
+                                    catch (VerificationRepository.AlreadyRegisteredException e) {
+                                        // throttling registrations
+                                        statsInvalidRegistrations++;
+                                        log.log(Level.INFO, "Throttling registration for: {0}", jid);
+                                        results.offer(packet.errorResult("wait",
+                                                Authorization.SERVICE_UNAVAILABLE.getErrorCode(),
+                                                Authorization.SERVICE_UNAVAILABLE.getCondition(),
+                                                "Too many attempts.",
+                                                true));
+                                        return;
+                                    }
+
+                                }
+                            }
+                            break;
+                        }
+                    }
+
                     default:
                         results.offer(Authorization.BAD_REQUEST.getResponseMessage(packet, "Message type is incorrect", true));
 
@@ -282,7 +318,8 @@ public class KontalkIqRegister extends XMPPProcessor implements XMPPProcessorIfc
         }
     }
 
-    private Packet registerPhone(XMPPResourceConnection session, Packet packet, String phoneInput) throws PacketErrorTypeException, TigaseDBException {
+    private void registerPhone(XMPPResourceConnection session, Packet packet, String phoneInput, Queue<Packet> results)
+            throws PacketErrorTypeException, TigaseDBException {
         String phone;
         try {
             phone = formatPhoneNumber(phoneInput);
@@ -291,7 +328,8 @@ public class KontalkIqRegister extends XMPPProcessor implements XMPPProcessorIfc
             // bad number
             statsInvalidRegistrations++;
             log.log(Level.INFO, "Invalid phone number: {0}", phoneInput);
-            return Authorization.BAD_REQUEST.getResponseMessage(packet, "Bad phone number.", true);
+            results.offer(Authorization.BAD_REQUEST.getResponseMessage(packet, "Bad phone number.", true));
+            return;
         }
 
         log.log(Level.FINEST, "Registering phone number: {0}", phone);
@@ -300,33 +338,51 @@ public class KontalkIqRegister extends XMPPProcessor implements XMPPProcessorIfc
         String userId = generateUserId(phone);
         BareJID jid = BareJID.bareJIDInstanceNS(userId, session.getDomainAsJID().getDomain());
 
-        // generate verification code
-        String code;
-        try {
-            code = generateVerificationCode(jid);
-        }
-        catch (VerificationRepository.AlreadyRegisteredException e) {
-            // throttling registrations
-            statsInvalidRegistrations++;
-            log.log(Level.INFO, "Throttling registration for: {0}", jid);
-            return packet.errorResult("wait",
-                    Authorization.SERVICE_UNAVAILABLE.getErrorCode(),
-                    Authorization.SERVICE_UNAVAILABLE.getCondition(),
-                    "Too many attempts.",
-                    true);
+        if (provider.isAsync()) {
+            // send async request and store ID in session
+            try {
+                String requestId = provider.sendVerificationCodeAsync(phone, session.getDomainAsJID(), results);
+                session.putSessionData(ASYNC_REQUEST_ID, requestId);
+                session.putSessionData(ASYNC_SESSION, packet.getPacketFrom());
+                session.putSessionData(ASYNC_PHONE_NUMBER, phone);
+            }
+            catch (IOException e) {
+                // throttling registrations
+                statsInvalidRegistrations++;
+                log.log(Level.WARNING, "Failed to send verification code for: {0}", jid);
+                results.offer(Authorization.NOT_ACCEPTABLE.getResponseMessage(packet, "Unable to send SMS.", true));
+            }
         }
 
-        // send SMS to phone number
-        try {
-            provider.sendVerificationCode(phone, code);
+        else {
+            // generate verification code
+            String code;
+            try {
+                code = generateVerificationCode(jid);
+            }
+            catch (VerificationRepository.AlreadyRegisteredException e) {
+                // throttling registrations
+                statsInvalidRegistrations++;
+                log.log(Level.INFO, "Throttling registration for: {0}", jid);
+                results.offer(packet.errorResult("wait",
+                        Authorization.SERVICE_UNAVAILABLE.getErrorCode(),
+                        Authorization.SERVICE_UNAVAILABLE.getCondition(),
+                        "Too many attempts.",
+                        true));
+                return;
+            }
 
-            return packet.okResult(prepareSMSResponseForm(provider.getSenderId()), 0);
-        }
-        catch (IOException e) {
-            // throttling registrations
-            statsInvalidRegistrations++;
-            log.log(Level.WARNING, "Failed to send verification code for: {0}", jid);
-            return Authorization.NOT_ACCEPTABLE.getResponseMessage(packet, "Unable to send SMS.", true);
+            // send SMS to phone number
+            try {
+                provider.sendVerificationCode(phone, code);
+                results.offer(packet.okResult(prepareSMSResponseForm(provider.getSenderId()), 0));
+            }
+            catch (IOException e) {
+                // throttling registrations
+                statsInvalidRegistrations++;
+                log.log(Level.WARNING, "Failed to send verification code for: {0}", jid);
+                results.offer(Authorization.NOT_ACCEPTABLE.getResponseMessage(packet, "Unable to send SMS.", true));
+            }
         }
     }
 
@@ -372,6 +428,11 @@ public class KontalkIqRegister extends XMPPProcessor implements XMPPProcessorIfc
     private String generateVerificationCode(BareJID jid)
             throws VerificationRepository.AlreadyRegisteredException, TigaseDBException {
         return repo.generateVerificationCode(jid);
+    }
+
+    private void saveVerificationCode(BareJID jid, String code)
+            throws VerificationRepository.AlreadyRegisteredException, TigaseDBException {
+        repo.setVerificationCode(jid, code);
     }
 
     private BareJID parseUserID(PGPPublicKey publicKey) throws PGPException {

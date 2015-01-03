@@ -21,9 +21,11 @@ package org.kontalk.xmppserver.registration;
 import com.nexmo.messaging.sdk.NexmoSmsClient;
 import com.nexmo.messaging.sdk.SmsSubmissionResult;
 import com.nexmo.messaging.sdk.messages.TextMessage;
+import tigase.server.Packet;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Queue;
 
 
 /**
@@ -78,6 +80,16 @@ public class NexmoProvider extends AbstractSMSVerificationProvider {
         else {
             throw new IOException("Unknown response");
         }
+    }
+
+    @Override
+    public boolean isAsync() {
+        return false;
+    }
+
+    @Override
+    public String sendVerificationCodeAsync(String phonenumber, Queue<Packet> results) throws IOException {
+        throw new UnsupportedOperationException("this provider is synchronous");
     }
 
 }

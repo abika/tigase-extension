@@ -64,13 +64,18 @@ public class DataVerificationRepository extends AbstractVerificationRepository {
     @Override
     public String generateVerificationCode(BareJID jid) throws AlreadyRegisteredException, TigaseDBException {
         String code = verificationCode();
+        setVerificationCode(jid, code);
+        return code;
+    }
+
+    @Override
+    public void setVerificationCode(BareJID jid, String code) throws AlreadyRegisteredException, TigaseDBException {
         PreparedStatement stm;
         try {
             stm = repo.getPreparedStatement(jid, CREATE_QUERY_ID);
             stm.setString(1, jid.toString());
             stm.setString(2, code);
             stm.execute();
-            return code;
         }
         catch (SQLException e) {
             if (e instanceof SQLIntegrityConstraintViolationException)
